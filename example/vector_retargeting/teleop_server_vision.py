@@ -1,9 +1,9 @@
 import multiprocessing
+import sys
 import time
 from pathlib import Path
 from queue import Empty
-from typing import Optional
-import sys
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -14,26 +14,27 @@ from pyorbbecsdk import (
     Pipeline, Config, OBSensorType, OBFormat,
     AlignFilter, OBStreamType
 )
-from scipy.spatial.transform import Rotation as R
 
 from dex_retargeting.constants import (
     RobotName,
     RetargetingType,
     HandType,
-    get_default_config_path,
+    get_default_config_path
 )
 from dex_retargeting.retargeting_config import RetargetingConfig
-from single_hand_detector import SingleHandDetector
+from dual_hand_detector import DualHandDetector
+from scipy.spatial.transform import Rotation as R
 
 logger.remove()
 logger.add(
     sys.stderr,
-    format="<light-blue>{time:YYYY-MM-DD HH:mm:ss}</light-blue> | <level>{level: <8}</level> | <yellow>{name}</yellow>:<cyan>{function}</cyan>:<yellow>{line}</yellow> - <level>{message}</level>",
+    format="<light-blue>{time:YYYY-MM-DD HH:mm:ss}</light-blue> | <level>{level: <8}</level> |"
+           " <yellow>{name}</yellow>:<cyan>{function}</cyan>:<yellow>{line}</yellow> - <level>{message}</level>",
     level="INFO",
     colorize=True
 )
 
-MIN_DEPTH = 200  # 200mm
+MIN_DEPTH = 20  # 20mm
 MAX_DEPTH = 2000  # 2000mm
 
 
@@ -62,38 +63,28 @@ def produce_frames(queue):
     logger.info("正在初始化奥比中光相机...")
 
     try:
+        # 配置深度流
         profile_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-        assert profile_list is not None, "未找到深度相机"
-
         depth_profile = profile_list.get_video_stream_profile(640, 480, OBFormat.Y16, 30)
         config.enable_stream(depth_profile)
 
+        # 配置彩色流
         color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-        assert color_profiles is not None, "未找到彩色相机"
-
         color_profile = color_profiles.get_video_stream_profile(640, 480, OBFormat.RGB, 30)
         config.enable_stream(color_profile)
 
     except Exception as e:
-        logger.warning(f"配置失败：{e}")
-        logger.warning("尝试使用默认配置...")
+        logger.warning(f"⚠️ 配置失败：{e}，尝试默认配置")
         config.enable_all_stream()
 
     pipeline.start(config)
-
-    # 💡 新增：向奥比中光 SDK 请求真实相机内参
-    try:
-        camera_param = pipeline.get_camera_param()
-        # 注意：因为使用了 AlignFilter 对齐到了彩色图像，所以必须用彩色相机的内参！
-        intrinsic = camera_param.rgb_intrinsic
-        intrinsics = (intrinsic.fx, intrinsic.fy, intrinsic.cx, intrinsic.cy)
-        logger.info(
-            f"✅ 成功获取奥比中光真实内参: fx={intrinsic.fx:.1f}, fy={intrinsic.fy:.1f}, cx={intrinsic.cx:.1f}, cy={intrinsic.cy:.1f}")
-    except Exception as e:
-        logger.warning(f"⚠️ 获取真实内参失败，使用备用经验值: {e}")
-        intrinsics = (500.0, 500.0, 320.0, 240.0)  # 640x480 的近似值
-
     align_filter = AlignFilter(OBStreamType.COLOR_STREAM)
+
+    camera_param = pipeline.get_camera_param()
+    intrinsic = camera_param.rgb_intrinsic
+    intrinsics = (intrinsic.fx, intrinsic.fy, intrinsic.cx, intrinsic.cy)
+    logger.info(
+        f"✅ 成功获取奥比中光真实内参: fx={intrinsic.fx:.1f}, fy={intrinsic.fy:.1f}, cx={intrinsic.cx:.1f}, cy={intrinsic.cy:.1f}")
 
     last_print_time = time.time()
     frame_count = 0
@@ -152,9 +143,6 @@ def produce_frames(queue):
 
                 depth_data = temporal_filter.process(depth_data.astype(np.uint16))
 
-                if color_img.shape[:2] != depth_data.shape[:2]:
-                    color_img = cv2.resize(color_img, (depth_data.shape[1], depth_data.shape[0]))
-
             except Exception as e:
                 logger.error(f"数据转换异常：{e}")
                 continue
@@ -184,27 +172,26 @@ def produce_frames(queue):
         pipeline.stop()
 
 
-def start_vision_server(queue, robot_dir: str = None, config_path: str = None):
-    """视觉服务端 - 支持 ZMQ 通信"""
+def start_vision_server(queue, robot_dir: str, config_paths: dict):
+    """视觉服务端 - 支持双臂/单臂 ZMQ 通信"""
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
     socket.bind("tcp://0.0.0.0:5555")
 
     # 加载重定向配置
     RetargetingConfig.set_default_urdf_dir(str(robot_dir))
-    logger.info(f"Start retargeting with config {config_path}")
-    retargeting = RetargetingConfig.load_from_file(config_path).build()
-    hand_type = "Right" if "right" in config_path.lower() else "Left"
-    detector = SingleHandDetector(hand_type=hand_type)
+    retargeting_dict = {}
 
-    # 状态跟踪
-    prev_T = None
+    for ht, config_path in config_paths.items():
+        logger.info(f"Loading {ht} hand retargeting config: {config_path}")
+        retargeting_dict[ht] = RetargetingConfig.load_from_file(config_path).build()
+        logger.info(f"  {ht} 关节数量: {len(retargeting_dict[ht].joint_names)}")
+
+    # MediaPipe: selfie=False 以确保左右手不反转
+    detector = DualHandDetector(selfie=False)
+
     frame_count = 0
-
-    logger.info(f"视觉服务端启动：Dexterous 模式")
-    logger.info(f"  重定向类型：{retargeting.optimizer.retargeting_type}")
-    logger.info(f"  关节数量：{len(retargeting.joint_names)}")
-    logger.info(f"  关节名：{retargeting.joint_names}")
+    logger.info(f"视觉服务端启动：双臂/单臂混合兼容模式")
 
     while True:
         try:
@@ -216,87 +203,167 @@ def start_vision_server(queue, robot_dir: str = None, config_path: str = None):
         except Empty:
             continue
 
-        ts = int(time.time() * 1000)
-        num_box, joint_pos, keypoint_2d, wrist_rot = detector.detect(rgb, ts)
+        # 使用 DualHandDetector 预测
+        num_box, joint_pos_dict, keypoint_2d_dict, wrist_rot_dict = detector.detect(rgb)
 
         frame_count += 1
+        msg = {}
 
-        if joint_pos is not None:
-            # 计算腕部位姿
-            h, w = depth_img.shape
-            u, v = int(keypoint_2d[0].x * w), int(keypoint_2d[0].y * h)
-            u, v = np.clip(u, 0, w - 1), np.clip(v, 0, h - 1)
+        if num_box > 0:
+            for ht, joint_pos in joint_pos_dict.items():
+                if ht not in retargeting_dict:
+                    continue  # 用户没有请求这个手的配置，则忽略
 
-            z_mm = float(depth_img[v, u])
-            z = z_mm * 0.001
-            z = np.clip(z, 0.3, 2.0)
+                keypoint_2d = keypoint_2d_dict[ht]
+                wrist_rot = wrist_rot_dict[ht]
+                retargeting = retargeting_dict[ht]
 
-            # 🚨 修改 2：使用真实的出厂标定内参计算真实的 X, Y 米数！
-            x = (u - cx) * z / fx
-            y = (v - cy) * z / fy
+                # --- 1. 计算深度与空间坐标 ---
+                h, w = depth_img.shape
+                u = int(keypoint_2d.landmark[0].x * w)
+                v = int(keypoint_2d.landmark[0].y * h)
+                u, v = np.clip(u, 0, w - 1), np.clip(v, 0, h - 1)
 
-            T_curr = np.eye(4)
-            T_curr[:3, :3] = wrist_rot
+                half_win = 2  # 5x5 窗口
+                v_min, v_max = max(0, v - half_win), min(h, v + half_win + 1)
+                u_min, u_max = max(0, u - half_win), min(w, u + half_win + 1)
 
-            # 填入最精确的物理坐标！
-            T_curr[:3, 3] = [x, y, z]
-            # 重定向计算
-            retargeting_type = retargeting.optimizer.retargeting_type
-            indices = retargeting.optimizer.target_link_human_indices
+                depth_roi = depth_img[v_min:v_max, u_min:u_max]
+                valid_depths = depth_roi[depth_roi > 0]
 
-            if retargeting_type == "POSITION":
-                ref_value = np.array(joint_pos[indices, :])
-            else:
-                origin_indices = indices[0, :]
-                task_indices = indices[1, :]
-                ref_value = joint_pos[task_indices, :] - joint_pos[origin_indices, :]
+                if len(valid_depths) > 0:
+                    z_mm = float(np.median(valid_depths))
+                else:
+                    z_mm = 0
 
-            if ref_value.ndim == 1:
-                ref_value = ref_value[None, :]
-            elif ref_value.ndim == 0:
-                logger.error("ref_value 计算异常，请检查 YAML 配置文件中的索引")
-                continue
+                z = z_mm * 0.001
+                z = np.clip(z, 0.01, 2.0)
 
-            qpos = retargeting.retarget(ref_value)
-            logger.info(f"{hand_type} hand retargeting: {qpos}")
+                x = (u - cx) * z / fx
+                y = (v - cy) * z / fy
 
-            if qpos is not None:
-                socket.send_json({
+                T_curr = np.eye(4)
+                T_curr[:3, :3] = wrist_rot
+                T_curr[:3, 3] = [x, y, z]
+
+                # --- 2. 运动学重定向 ---
+                retargeting_type = retargeting.optimizer.retargeting_type
+                indices = retargeting.optimizer.target_link_human_indices
+
+                if retargeting_type == "POSITION":
+                    ref_value = np.array(joint_pos[indices, :])
+                else:
+                    origin_indices = indices[0, :]
+                    task_indices = indices[1, :]
+                    ref_value = joint_pos[task_indices, :] - joint_pos[origin_indices, :]
+
+                if ref_value.ndim == 1:
+                    ref_value = ref_value[None, :]
+
+                qpos = retargeting.retarget(ref_value)
+
+                # --- 3. 封装当前手的数据 ---
+                msg[ht] = {
                     "wrist_pose": T_curr.tolist(),
-                    "robot_joints": qpos.tolist()
-                })
+                    "robot_joints": qpos.tolist() if qpos is not None else [0.0] * len(retargeting.joint_names)
+                }
+
+                # --- 4. 渲染界面信息 ---
+                thumb_tip = joint_pos[4]
+                index_tip = joint_pos[8]
+                pinch_dist = np.linalg.norm(thumb_tip - index_tip)
+                gripper_val = np.clip((pinch_dist - 0.02) / (0.15 - 0.02) * 2.0 - 1.0, -1.0, 1.0)
+
+                # 右手绿色，左手黄色，位置上下错开
+                y_offset = 30 if ht == "Right" else 90
+                color = (0, 255, 0) if ht == "Right" else (255, 255, 0)
+
+                # 1. 显示手腕 3D 位置
+                wrist_x, wrist_y, wrist_z = T_curr[:3, 3]
+                pos_text = f"Pos: [{wrist_x:.3f}, {wrist_y:.3f}, {wrist_z:.3f}] m"
+                cv2.putText(color_img, pos_text, (10, y_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+ 
+                # 2. 计算并显示手腕朝向（欧拉角）
+                wrist_rot_matrix = T_curr[:3, :3]
+                rotation = R.from_matrix(wrist_rot_matrix)
+                euler_angles = rotation.as_euler('xyz', degrees=True)  # [roll, pitch, yaw]
+
+                roll, pitch, yaw = euler_angles
+                orient_text = f"Ori: [{roll:.1f}, {pitch:.1f}, {yaw:.1f}]"
+                cv2.putText(color_img, orient_text, (10, y_offset + 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+                # 3. 绘制手腕坐标系方向指示器（小箭头）
+                wrist_2d_x = int(keypoint_2d.landmark[0].x * w)
+                wrist_2d_y = int(keypoint_2d.landmark[0].y * h)
+                arrow_length = 40  # 像素
+
+                # 提取旋转矩阵的列向量（局部坐标轴方向）
+                x_axis = wrist_rot_matrix[:, 0]  # X 轴（红色）
+                y_axis = wrist_rot_matrix[:, 1]  # Y 轴（绿色）
+                z_axis = wrist_rot_matrix[:, 2]  # Z 轴（蓝色）
+
+                # 投影到 2D 平面（简化处理，忽略深度变化）
+                # X 轴 - 红色箭头
+                end_x = (
+                    int(wrist_2d_x + x_axis[0] * arrow_length),
+                    int(wrist_2d_y + x_axis[1] * arrow_length)
+                )
+                cv2.arrowedLine(color_img, (wrist_2d_x, wrist_2d_y), end_x,
+                                (0, 0, 255), 2, tipLength=0.3)
+
+                # Y 轴 - 绿色箭头
+                end_y = (
+                    int(wrist_2d_x + y_axis[0] * arrow_length),
+                    int(wrist_2d_y + y_axis[1] * arrow_length)
+                )
+                cv2.arrowedLine(color_img, (wrist_2d_x, wrist_2d_y), end_y,
+                                (0, 255, 0), 2, tipLength=0.3)
+
+                # Z 轴 - 蓝色箭头
+                end_z = (
+                    int(wrist_2d_x + z_axis[0] * arrow_length),
+                    int(wrist_2d_y + z_axis[1] * arrow_length)
+                )
+                cv2.arrowedLine(color_img, (wrist_2d_x, wrist_2d_y), end_z,
+                                (255, 0, 0), 2, tipLength=0.3)
+
+                # 标注坐标轴文字
+                cv2.putText(color_img, "X", (end_x[0] + 5, end_x[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                cv2.putText(color_img, "Y", (end_y[0] + 5, end_y[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.putText(color_img, "Z", (end_z[0] + 5, end_z[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
                 if frame_count % 30 == 0:
-                    logger.debug(f"灵巧手关节：{[f'{x:.3f}' for x in qpos]}")
-            else:
-                socket.send_json({
-                    "wrist_pose": T_curr.tolist(),
-                    "robot_joints": [0.0] * len(retargeting.joint_names)
-                })
+                    logger.info(f"{ht} hand retargeting generated.")
 
-            # 绘制可视化
-            color_img = detector.draw_skeleton_on_image(color_img, keypoint_2d)
+                # 绘制骨架
+            color_img = DualHandDetector.draw_skeleton_on_image(color_img, keypoint_2d_dict, style="default")
 
-            # 计算捏合距离（用于显示）
-            thumb_tip = joint_pos[4]
-            index_tip = joint_pos[8]
-            pinch_dist = np.linalg.norm(thumb_tip - index_tip)
-            gripper_val = np.clip((pinch_dist - 0.02) / (0.15 - 0.02) * 2.0 - 1.0, -1.0, 1.0)
 
-            info_text = f"Dist={pinch_dist:.3f}, Grip={gripper_val:.2f}"
-            cv2.putText(color_img, info_text, (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-            mode_text = f"Mode: Dexterous"
-            cv2.putText(color_img, mode_text, (10, color_img.shape[0] - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
         else:
-            socket.send_json({
-                "wrist_pose": np.eye(4).tolist(),
-                "robot_joints": [0.0] * 12
-            })
             cv2.putText(color_img, "No hand detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+        # 优先抽取右手数据放到根目录，如果没有右手则抽左手数据
+        if "Right" in msg:
+            msg["wrist_pose"] = msg["Right"]["wrist_pose"]
+            msg["robot_joints"] = msg["Right"]["robot_joints"]
+        elif "Left" in msg:
+            msg["wrist_pose"] = msg["Left"]["wrist_pose"]
+            msg["robot_joints"] = msg["Left"]["robot_joints"]
+        else:
+            # 没检测到手，发送空基准位姿
+            msg["wrist_pose"] = np.eye(4).tolist()
+            # 根据有无右手的配置随便填个长度回去，防止客户端报错
+            sample_ht = "Right" if "Right" in retargeting_dict else list(retargeting_dict.keys())[0]
+            msg["robot_joints"] = [0.0] * len(retargeting_dict[sample_ht].joint_names)
+
+        # 发送融合后的 JSON
+        socket.send_json(msg)
 
         cv2.imshow("Teleop Server", color_img)
         if cv2.waitKey(1) == ord('q'):
@@ -306,10 +373,9 @@ def start_vision_server(queue, robot_dir: str = None, config_path: str = None):
 def main(
     robot_name: RobotName,
     retargeting_type: RetargetingType,
-    hand_type: HandType,
+    hand_type: Literal["right", "left", "both"] = "both",
 ):
-    """主函数 - 参照官方示例风格"""
-    config_path = get_default_config_path(robot_name, retargeting_type, hand_type)
+    """主函数"""
     robot_dir = (
         Path(__file__).absolute().parent.parent.parent / "assets" / "robots" / "hands"
     )
@@ -317,12 +383,18 @@ def main(
     logger.info(f"启动视觉服务端...")
     logger.info(f"  机器人：{robot_name.value}")
     logger.info(f"  重定向类型：{retargeting_type.value}")
-    logger.info(f"  手性：{hand_type.value}")
-    logger.info(f"  配置文件：{config_path}")
+    logger.info(f"  手部模式：{hand_type}")
+
+    # 根据传入的模式加载对应的配置文件
+    config_paths = {}
+    if hand_type in ["right", "both"]:
+        config_paths["Right"] = str(get_default_config_path(robot_name, retargeting_type, HandType.right))
+    if hand_type in ["left", "both"]:
+        config_paths["Left"] = str(get_default_config_path(robot_name, retargeting_type, HandType.left))
 
     q = multiprocessing.Queue(maxsize=2)
     producer = multiprocessing.Process(target=produce_frames, args=(q,))
-    consumer = multiprocessing.Process(target=start_vision_server, args=(q, str(robot_dir), str(config_path)))
+    consumer = multiprocessing.Process(target=start_vision_server, args=(q, str(robot_dir), config_paths))
 
     producer.start()
     consumer.start()
