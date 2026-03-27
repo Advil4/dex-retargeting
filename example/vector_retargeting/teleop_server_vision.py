@@ -56,6 +56,7 @@ class TemporalFilter:
 
 
 # def produce_frames(queue):
+#     """realsense相机数据采集进程"""
 #     pipeline = rs.pipeline()
 #     config = rs.config()
 #     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
@@ -85,7 +86,7 @@ class TemporalFilter:
 
 
 def produce_frames(queue):
-    """相机数据采集进程"""
+    """奥比中光相机数据采集进程"""
     pipeline = Pipeline()
     config = Config()
     temporal_filter = TemporalFilter(alpha=0.3)
