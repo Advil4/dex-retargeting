@@ -24,6 +24,7 @@ from dex_retargeting.constants import (
 from dex_retargeting.retargeting_config import RetargetingConfig
 from dual_hand_detector import DualHandDetector
 from scipy.spatial.transform import Rotation as R
+import pyrealsense2 as rs
 
 logger.remove()
 logger.add(
@@ -52,6 +53,35 @@ class TemporalFilter:
             result = cv2.addWeighted(frame, self.alpha, self.previous_frame, 1 - self.alpha, 0)
         self.previous_frame = result
         return result
+
+
+# def produce_frames(queue):
+#     pipeline = rs.pipeline()
+#     config = rs.config()
+#     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+#     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+#     profile = pipeline.start(config)
+#     align = rs.align(rs.stream.color)
+#
+#     # 获取相机内参
+#     color_profile = rs.video_stream_profile(profile.get_stream(rs.stream.color))
+#     intrinsics = color_profile.get_intrinsics()
+#     fx, fy, cx, cy = intrinsics.fx, intrinsics.fy, intrinsics.ppx, intrinsics.ppy
+#
+#     try:
+#         while True:
+#             frames = pipeline.wait_for_frames()
+#             aligned = align.process(frames)
+#             color_img = np.asanyarray(aligned.get_color_frame().get_data())
+#             depth_img = np.asanyarray(aligned.get_depth_frame().get_data())
+#             if queue.full():
+#                 try:
+#                     queue.get_nowait()
+#                 except Empty:
+#                     pass
+#             queue.put((color_img, depth_img, (fx, fy, cx, cy)))
+#     finally:
+#         pipeline.stop()
 
 
 def produce_frames(queue):
@@ -186,6 +216,7 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
         logger.info(f"Loading {ht} hand retargeting config: {config_path}")
         retargeting_dict[ht] = RetargetingConfig.load_from_file(config_path).build()
         logger.info(f"  {ht} 关节数量: {len(retargeting_dict[ht].joint_names)}")
+        logger.info(f"  {ht} 关节映射关系: {retargeting_dict[ht].joint_names}")
 
     # MediaPipe: selfie=False 以确保左右手不反转
     detector = DualHandDetector(selfie=False)
@@ -283,7 +314,7 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
                 pos_text = f"Pos: [{wrist_x:.3f}, {wrist_y:.3f}, {wrist_z:.3f}] m"
                 cv2.putText(color_img, pos_text, (10, y_offset),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
- 
+
                 # 2. 计算并显示手腕朝向（欧拉角）
                 wrist_rot_matrix = T_curr[:3, :3]
                 rotation = R.from_matrix(wrist_rot_matrix)
@@ -348,21 +379,16 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
             cv2.putText(color_img, "No hand detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        # 优先抽取右手数据放到根目录，如果没有右手则抽左手数据
-        if "Right" in msg:
-            msg["wrist_pose"] = msg["Right"]["wrist_pose"]
-            msg["robot_joints"] = msg["Right"]["robot_joints"]
-        elif "Left" in msg:
-            msg["wrist_pose"] = msg["Left"]["wrist_pose"]
-            msg["robot_joints"] = msg["Left"]["robot_joints"]
-        else:
-            # 没检测到手，发送空基准位姿
-            msg["wrist_pose"] = np.eye(4).tolist()
-            # 根据有无右手的配置随便填个长度回去，防止客户端报错
-            sample_ht = "Right" if "Right" in retargeting_dict else list(retargeting_dict.keys())[0]
-            msg["robot_joints"] = [0.0] * len(retargeting_dict[sample_ht].joint_names)
+        # 处理未检测到手的情况：为缺失的手提供空数据
+        if num_box == 0:
+            # 没有检测到手，为所有配置的手提供空数据
+            for ht in retargeting_dict.keys():
+                msg[ht] = {
+                    "wrist_pose": np.eye(4).tolist(),
+                    "robot_joints": [0.0] * len(retargeting_dict[ht].joint_names)
+                }
 
-        # 发送融合后的 JSON
+        # 发送分离的左右手数据 JSON
         socket.send_json(msg)
 
         cv2.imshow("Teleop Server", color_img)
