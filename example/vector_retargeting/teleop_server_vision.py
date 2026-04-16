@@ -250,7 +250,6 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
                 wrist_rot = wrist_rot_dict[ht]
                 retargeting = retargeting_dict[ht]
 
-                # --- 1. 计算深度与空间坐标 ---
                 h, w = depth_img.shape
                 u = int(keypoint_2d.landmark[0].x * w)
                 v = int(keypoint_2d.landmark[0].y * h)
@@ -278,7 +277,6 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
                 T_curr[:3, :3] = wrist_rot
                 T_curr[:3, 3] = [x, y, z]
 
-                # --- 2. 运动学重定向 ---
                 retargeting_type = retargeting.optimizer.retargeting_type
                 indices = retargeting.optimizer.target_link_human_indices
 
@@ -294,17 +292,10 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
 
                 qpos = retargeting.retarget(ref_value)
 
-                # --- 3. 封装当前手的数据 ---
                 msg[ht] = {
                     "wrist_pose": T_curr.tolist(),
                     "robot_joints": qpos.tolist() if qpos is not None else [0.0] * len(retargeting.joint_names)
                 }
-
-                # --- 4. 渲染界面信息 ---
-                thumb_tip = joint_pos[4]
-                index_tip = joint_pos[8]
-                pinch_dist = np.linalg.norm(thumb_tip - index_tip)
-                gripper_val = np.clip((pinch_dist - 0.02) / (0.15 - 0.02) * 2.0 - 1.0, -1.0, 1.0)
 
                 # 右手绿色，左手黄色，位置上下错开
                 y_offset = 30 if ht == "Right" else 90
@@ -336,7 +327,6 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
                 y_axis = wrist_rot_matrix[:, 1]  # Y 轴（绿色）
                 z_axis = wrist_rot_matrix[:, 2]  # Z 轴（蓝色）
 
-                # 投影到 2D 平面（简化处理，忽略深度变化）
                 # X 轴 - 红色箭头
                 end_x = (
                     int(wrist_2d_x + x_axis[0] * arrow_length),
@@ -361,7 +351,6 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
                 cv2.arrowedLine(color_img, (wrist_2d_x, wrist_2d_y), end_z,
                                 (255, 0, 0), 2, tipLength=0.3)
 
-                # 标注坐标轴文字
                 cv2.putText(color_img, "X", (end_x[0] + 5, end_x[1]),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                 cv2.putText(color_img, "Y", (end_y[0] + 5, end_y[1]),
@@ -372,7 +361,6 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
                 if frame_count % 30 == 0:
                     logger.info(f"{ht} hand retargeting generated.")
 
-                # 绘制骨架
             color_img = DualHandDetector.draw_skeleton_on_image(color_img, keypoint_2d_dict, style="default")
 
 
@@ -382,14 +370,12 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
 
         # 处理未检测到手的情况：为缺失的手提供空数据
         if num_box == 0:
-            # 没有检测到手，为所有配置的手提供空数据
             for ht in retargeting_dict.keys():
                 msg[ht] = {
                     "wrist_pose": np.eye(4).tolist(),
                     "robot_joints": [0.0] * len(retargeting_dict[ht].joint_names)
                 }
 
-        # 发送分离的左右手数据 JSON
         socket.send_json(msg)
 
         cv2.imshow("Teleop Server", color_img)
@@ -402,7 +388,6 @@ def main(
     retargeting_type: RetargetingType,
     hand_type: Literal["right", "left", "both"] = "both",
 ):
-    """主函数"""
     robot_dir = (
         Path(__file__).absolute().parent.parent.parent / "assets" / "robots" / "hands"
     )
@@ -412,7 +397,6 @@ def main(
     logger.info(f"  重定向类型：{retargeting_type.value}")
     logger.info(f"  手部模式：{hand_type}")
 
-    # 根据传入的模式加载对应的配置文件
     config_paths = {}
     if hand_type in ["right", "both"]:
         config_paths["Right"] = str(get_default_config_path(robot_name, retargeting_type, HandType.right))
