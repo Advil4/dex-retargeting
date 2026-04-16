@@ -88,8 +88,15 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
     elif "svh" in robot_name:
         loader.scale = 1.5
 
+    # Try to use GLB version if available, otherwise use original URDF
     if "glb" not in robot_name:
-        filepath = str(filepath).replace(".urdf", "_glb.urdf")
+        glb_filepath = str(filepath).replace(".urdf", "_glb.urdf")
+        if Path(glb_filepath).exists():
+            filepath = glb_filepath
+            logger.info(f"✨ Using GLB-enhanced URDF: {Path(filepath).name}")
+        else:
+            filepath = str(filepath)
+            logger.info(f"⚠️  GLB version not found ({Path(glb_filepath).name}), using original URDF: {Path(filepath).name}")
     else:
         filepath = str(filepath)
 
