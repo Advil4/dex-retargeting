@@ -55,159 +55,159 @@ class TemporalFilter:
         return result
 
 
-# def produce_frames(queue):
-#     """realsense相机数据采集进程"""
-#     pipeline = rs.pipeline()
-#     config = rs.config()
-#     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-#     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-#     profile = pipeline.start(config)
-#     align = rs.align(rs.stream.color)
-#
-#     # 获取相机内参
-#     color_profile = rs.video_stream_profile(profile.get_stream(rs.stream.color))
-#     intrinsics = color_profile.get_intrinsics()
-#     fx, fy, cx, cy = intrinsics.fx, intrinsics.fy, intrinsics.ppx, intrinsics.ppy
-#
-#     try:
-#         while True:
-#             frames = pipeline.wait_for_frames()
-#             aligned = align.process(frames)
-#             color_img = np.asanyarray(aligned.get_color_frame().get_data())
-#             depth_img = np.asanyarray(aligned.get_depth_frame().get_data())
-#             if queue.full():
-#                 try:
-#                     queue.get_nowait()
-#                 except Empty:
-#                     pass
-#             queue.put((color_img, depth_img, (fx, fy, cx, cy)))
-#     finally:
-#         pipeline.stop()
-
-
 def produce_frames(queue):
-    """奥比中光相机数据采集进程"""
-    pipeline = Pipeline()
-    config = Config()
-    temporal_filter = TemporalFilter(alpha=0.3)
+    """realsense相机数据采集进程"""
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    profile = pipeline.start(config)
+    align = rs.align(rs.stream.color)
 
-    logger.info("正在初始化奥比中光相机...")
-
-    try:
-        # 配置深度流
-        profile_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-        depth_profile = profile_list.get_video_stream_profile(640, 480, OBFormat.Y16, 30)
-        config.enable_stream(depth_profile)
-
-        # 配置彩色流
-        color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-        color_profile = color_profiles.get_video_stream_profile(640, 480, OBFormat.RGB, 30)
-        config.enable_stream(color_profile)
-
-    except Exception as e:
-        logger.warning(f"⚠️ 配置失败：{e}，尝试默认配置")
-        config.enable_all_stream()
-
-    pipeline.start(config)
-    align_filter = AlignFilter(OBStreamType.COLOR_STREAM)
-
-    camera_param = pipeline.get_camera_param()
-    intrinsic = camera_param.rgb_intrinsic
-    intrinsics = (intrinsic.fx, intrinsic.fy, intrinsic.cx, intrinsic.cy)
-    logger.info(
-        f"✅ 成功获取奥比中光真实内参: fx={intrinsic.fx:.1f}, fy={intrinsic.fy:.1f}, cx={intrinsic.cx:.1f}, cy={intrinsic.cy:.1f}")
-
-    last_print_time = time.time()
-    frame_count = 0
-
-    logger.info("相机已启动，开始采集数据...")
+    # 获取相机内参
+    color_profile = rs.video_stream_profile(profile.get_stream(rs.stream.color))
+    intrinsics = color_profile.get_intrinsics()
+    fx, fy, cx, cy = intrinsics.fx, intrinsics.fy, intrinsics.ppx, intrinsics.ppy
 
     try:
         while True:
-            frames = pipeline.wait_for_frames(1000)
-            if frames is None:
-                continue
-
-            aligned_frames = align_filter.process(frames)
-            if aligned_frames is None:
-                continue
-
-            color_frame = aligned_frames.get_color_frame()
-            depth_frame = aligned_frames.get_depth_frame()
-
-            if color_frame is None or depth_frame is None:
-                continue
-
-            try:
-                c_v_frame = color_frame.as_video_frame()
-                raw_color_data = np.asanyarray(c_v_frame.get_data(), dtype=np.uint8)
-                raw_color_data = np.ascontiguousarray(raw_color_data)
-
-                fmt = c_v_frame.get_format()
-
-                if fmt == OBFormat.BGR:
-                    color_img = raw_color_data.reshape((c_v_frame.get_height(), c_v_frame.get_width(), 3))
-                elif fmt == OBFormat.RGB:
-                    color_img = raw_color_data.reshape((c_v_frame.get_height(), c_v_frame.get_width(), 3))
-                    color_img = cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR)
-                else:
-                    color_img = cv2.imdecode(raw_color_data, cv2.IMREAD_COLOR)
-
-                if color_img is None:
-                    continue
-
-                d_v_frame = depth_frame.as_video_frame()
-                width = d_v_frame.get_width()
-                height = d_v_frame.get_height()
-                scale = depth_frame.get_depth_scale()
-
-                depth_data = np.frombuffer(d_v_frame.get_data(), dtype=np.uint16)
-                depth_data = depth_data.reshape((height, width))
-
-                depth_data = depth_data.astype(np.float32) * scale
-
-                depth_data = np.where(
-                    (depth_data > MIN_DEPTH) & (depth_data < MAX_DEPTH),
-                    depth_data,
-                    0
-                )
-
-                depth_data = temporal_filter.process(depth_data.astype(np.uint16))
-
-            except Exception as e:
-                logger.error(f"数据转换异常：{e}")
-                continue
-
+            frames = pipeline.wait_for_frames()
+            aligned = align.process(frames)
+            color_img = np.asanyarray(aligned.get_color_frame().get_data())
+            depth_img = np.asanyarray(aligned.get_depth_frame().get_data())
             if queue.full():
                 try:
                     queue.get_nowait()
-                except:
+                except Empty:
                     pass
-            queue.put((color_img, depth_data, intrinsics))
-
-            frame_count += 1
-            current_time = time.time()
-
-            if current_time - last_print_time >= 2.0:
-                elapsed = current_time - last_print_time
-                fps = frame_count / elapsed
-                logger.info(f"相机帧率：{fps:.1f} FPS")
-                frame_count = 0
-                last_print_time = current_time
-
-    except KeyboardInterrupt:
-        logger.info("\n停止相机采集...")
-    except Exception as e:
-        logger.error(f"相机异常：{e}")
+            queue.put((color_img, depth_img, (fx, fy, cx, cy)))
     finally:
         pipeline.stop()
+
+
+# def produce_frames(queue):
+#     """奥比中光相机数据采集进程"""
+#     pipeline = Pipeline()
+#     config = Config()
+#     temporal_filter = TemporalFilter(alpha=0.3)
+#
+#     logger.info("正在初始化奥比中光相机...")
+#
+#     try:
+#         # 配置深度流
+#         profile_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+#         depth_profile = profile_list.get_video_stream_profile(640, 480, OBFormat.Y16, 30)
+#         config.enable_stream(depth_profile)
+#
+#         # 配置彩色流
+#         color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+#         color_profile = color_profiles.get_video_stream_profile(640, 480, OBFormat.RGB, 30)
+#         config.enable_stream(color_profile)
+#
+#     except Exception as e:
+#         logger.warning(f"⚠️ 配置失败：{e}，尝试默认配置")
+#         config.enable_all_stream()
+#
+#     pipeline.start(config)
+#     align_filter = AlignFilter(OBStreamType.COLOR_STREAM)
+#
+#     camera_param = pipeline.get_camera_param()
+#     intrinsic = camera_param.rgb_intrinsic
+#     intrinsics = (intrinsic.fx, intrinsic.fy, intrinsic.cx, intrinsic.cy)
+#     logger.info(
+#         f"✅ 成功获取奥比中光真实内参: fx={intrinsic.fx:.1f}, fy={intrinsic.fy:.1f}, cx={intrinsic.cx:.1f}, cy={intrinsic.cy:.1f}")
+#
+#     last_print_time = time.time()
+#     frame_count = 0
+#
+#     logger.info("相机已启动，开始采集数据...")
+#
+#     try:
+#         while True:
+#             frames = pipeline.wait_for_frames(1000)
+#             if frames is None:
+#                 continue
+#
+#             aligned_frames = align_filter.process(frames)
+#             if aligned_frames is None:
+#                 continue
+#
+#             color_frame = aligned_frames.get_color_frame()
+#             depth_frame = aligned_frames.get_depth_frame()
+#
+#             if color_frame is None or depth_frame is None:
+#                 continue
+#
+#             try:
+#                 c_v_frame = color_frame.as_video_frame()
+#                 raw_color_data = np.asanyarray(c_v_frame.get_data(), dtype=np.uint8)
+#                 raw_color_data = np.ascontiguousarray(raw_color_data)
+#
+#                 fmt = c_v_frame.get_format()
+#
+#                 if fmt == OBFormat.BGR:
+#                     color_img = raw_color_data.reshape((c_v_frame.get_height(), c_v_frame.get_width(), 3))
+#                 elif fmt == OBFormat.RGB:
+#                     color_img = raw_color_data.reshape((c_v_frame.get_height(), c_v_frame.get_width(), 3))
+#                     color_img = cv2.cvtColor(color_img, cv2.COLOR_RGB2BGR)
+#                 else:
+#                     color_img = cv2.imdecode(raw_color_data, cv2.IMREAD_COLOR)
+#
+#                 if color_img is None:
+#                     continue
+#
+#                 d_v_frame = depth_frame.as_video_frame()
+#                 width = d_v_frame.get_width()
+#                 height = d_v_frame.get_height()
+#                 scale = depth_frame.get_depth_scale()
+#
+#                 depth_data = np.frombuffer(d_v_frame.get_data(), dtype=np.uint16)
+#                 depth_data = depth_data.reshape((height, width))
+#
+#                 depth_data = depth_data.astype(np.float32) * scale
+#
+#                 depth_data = np.where(
+#                     (depth_data > MIN_DEPTH) & (depth_data < MAX_DEPTH),
+#                     depth_data,
+#                     0
+#                 )
+#
+#                 depth_data = temporal_filter.process(depth_data.astype(np.uint16))
+#
+#             except Exception as e:
+#                 logger.error(f"数据转换异常：{e}")
+#                 continue
+#
+#             if queue.full():
+#                 try:
+#                     queue.get_nowait()
+#                 except:
+#                     pass
+#             queue.put((color_img, depth_data, intrinsics))
+#
+#             frame_count += 1
+#             current_time = time.time()
+#
+#             if current_time - last_print_time >= 2.0:
+#                 elapsed = current_time - last_print_time
+#                 fps = frame_count / elapsed
+#                 logger.info(f"相机帧率：{fps:.1f} FPS")
+#                 frame_count = 0
+#                 last_print_time = current_time
+#
+#     except KeyboardInterrupt:
+#         logger.info("\n停止相机采集...")
+#     except Exception as e:
+#         logger.error(f"相机异常：{e}")
+#     finally:
+#         pipeline.stop()
 
 
 def start_vision_server(queue, robot_dir: str, config_paths: dict):
     """视觉服务端 - 支持双臂/单臂 ZMQ 通信"""
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
-    socket.bind("tcp://0.0.0.0:5555")
+    socket.bind("tcp://0.0.0.0:7777")
 
     # 加载重定向配置
     RetargetingConfig.set_default_urdf_dir(str(robot_dir))
@@ -221,6 +221,13 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
 
     # MediaPipe: selfie=False 以确保左右手不反转
     detector = DualHandDetector(selfie=False)
+
+    last_state = {}
+    for ht, retargeting in retargeting_dict.items():
+        last_state[ht] = {
+            "wrist_pose": np.eye(4).tolist(),
+            "robot_joints": [0.0] * len(retargeting.joint_names)
+        }
 
     frame_count = 0
     logger.info(f"视觉服务端启动：双臂/单臂混合兼容模式")
@@ -236,16 +243,20 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
             continue
 
         # 使用 DualHandDetector 预测
-        num_box, joint_pos_dict, keypoint_2d_dict, wrist_rot_dict = detector.detect(rgb)
+        _, joint_pos_dict, keypoint_2d_dict, wrist_rot_dict = detector.detect(rgb)
+
+        # 过滤掉未被请求的手部数据
+        for ht in list(joint_pos_dict.keys()):
+            if ht not in retargeting_dict:
+                joint_pos_dict.pop(ht, None)
+                keypoint_2d_dict.pop(ht, None)
+                wrist_rot_dict.pop(ht, None)
 
         frame_count += 1
         msg = {}
 
-        if num_box > 0:
+        if len(joint_pos_dict) > 0:
             for ht, joint_pos in joint_pos_dict.items():
-                if ht not in retargeting_dict:
-                    continue  # 用户没有请求这个手的配置，则忽略
-
                 keypoint_2d = keypoint_2d_dict[ht]
                 wrist_rot = wrist_rot_dict[ht]
                 retargeting = retargeting_dict[ht]
@@ -292,7 +303,8 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
 
                 qpos = retargeting.retarget(ref_value)
 
-                msg[ht] = {
+                # 记录该手最新的有效状态
+                last_state[ht] = {
                     "wrist_pose": T_curr.tolist(),
                     "robot_joints": qpos.tolist() if qpos is not None else [0.0] * len(retargeting.joint_names)
                 }
@@ -368,13 +380,8 @@ def start_vision_server(queue, robot_dir: str, config_paths: dict):
             cv2.putText(color_img, "No hand detected", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        # 处理未检测到手的情况：为缺失的手提供空数据
-        if num_box == 0:
-            for ht in retargeting_dict.keys():
-                msg[ht] = {
-                    "wrist_pose": np.eye(4).tolist(),
-                    "robot_joints": [0.0] * len(retargeting_dict[ht].joint_names)
-                }
+        for ht in retargeting_dict.keys():
+            msg[ht] = last_state[ht]
 
         socket.send_json(msg)
 
