@@ -20,6 +20,7 @@ from dex_retargeting.constants import (
 )
 from dex_retargeting.retargeting_config import RetargetingConfig
 from single_hand_detector import SingleHandDetector
+import pyrealsense2 as rs
 
 
 def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path: str):
@@ -87,6 +88,8 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
         loader.scale = 1.4
     elif "svh" in robot_name:
         loader.scale = 1.5
+    elif "unitree_dex3" in robot_name:
+        loader.scale = 1.0
 
     # Try to use GLB version if available, otherwise use original URDF
     if "glb" not in robot_name:
@@ -96,7 +99,8 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
             logger.info(f"✨ Using GLB-enhanced URDF: {Path(filepath).name}")
         else:
             filepath = str(filepath)
-            logger.info(f"⚠️  GLB version not found ({Path(glb_filepath).name}), using original URDF: {Path(filepath).name}")
+            logger.info(
+                f"⚠️  GLB version not found ({Path(glb_filepath).name}), using original URDF: {Path(filepath).name}")
     else:
         filepath = str(filepath)
 
@@ -116,6 +120,8 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
         robot.set_pose(sapien.Pose([0, 0, -0.15]))
     elif "svh" in robot_name:
         robot.set_pose(sapien.Pose([0, 0, -0.13]))
+    elif "unitree_dex3" in robot_name:
+        robot.set_pose(sapien.Pose([0, 0, -0.05]))  # 根据实际视觉效果微调高度
 
     # Different robot loader may have different orders for joints
     sapien_joint_names = [joint.get_name() for joint in robot.get_active_joints()]
@@ -159,147 +165,129 @@ def start_retargeting(queue: multiprocessing.Queue, robot_dir: str, config_path:
             viewer.render()
 
 
-def produce_frame(queue: multiprocessing.Queue, camera_path: Optional[str] = None):
-    """使用奥比中光相机采集图像 - 参考官方最佳实践"""
+def produce_frame(queue, camera_path: Optional[str] = None):
+    """realsense相机数据采集进程"""
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    profile = pipeline.start(config)
+    align = rs.align(rs.stream.color)
+
+    # 获取相机内参
+    color_profile = rs.video_stream_profile(profile.get_stream(rs.stream.color))
+    intrinsics = color_profile.get_intrinsics()
+    fx, fy, cx, cy = intrinsics.fx, intrinsics.fy, intrinsics.ppx, intrinsics.ppy
+
     try:
-        import pyorbbecsdk as ob
-        from pyorbbecsdk import OBSensorType, OBFormat, AlignFilter, OBStreamType
-
-        # 使用奥比中光 SDK
-        pipeline = ob.Pipeline()
-        config = ob.Config()
-
-        logger.info("🚀 正在初始化奥比中光相机...")
-
-        try:
-            # 配置深度流
-            profile_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
-            depth_profile = profile_list.get_video_stream_profile(640, 480, OBFormat.Y16, 30)
-            config.enable_stream(depth_profile)
-
-            # 配置彩色流
-            color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
-            color_profile = color_profiles.get_video_stream_profile(640, 480, OBFormat.RGB, 30)
-            config.enable_stream(color_profile)
-
-        except Exception as e:
-            logger.warning(f"⚠️ 配置失败：{e}，尝试默认配置")
-            config.enable_all_stream()
-
-        pipeline.start(config)
-        align_filter = AlignFilter(OBStreamType.COLOR_STREAM)
-
-        logger.info("✅ 奥比中光相机已启动")
-
-        frame_count = 0
-        last_log_time = time.time()
-
         while True:
-            frames = pipeline.wait_for_frames(1000)
-            if frames is None:
-                continue
-
-            aligned_frames = align_filter.process(frames)
-            if aligned_frames is None:
-                continue
-
-            color_frame = aligned_frames.get_color_frame()
-            if color_frame is None:
-                continue
-
-            try:
-                c_v_frame = color_frame.as_video_frame()
-                raw_color_data = np.asanyarray(c_v_frame.get_data(), dtype=np.uint8)
-                raw_color_data = np.ascontiguousarray(raw_color_data)
-
-                fmt = c_v_frame.get_format()
-
-                if fmt == OBFormat.BGR:
-                    bgr_img = raw_color_data.reshape((c_v_frame.get_height(), c_v_frame.get_width(), 3))
-                elif fmt == OBFormat.RGB:
-                    bgr_img = raw_color_data.reshape((c_v_frame.get_height(), c_v_frame.get_width(), 3))
-                    bgr_img = cv2.cvtColor(bgr_img, cv2.COLOR_RGB2BGR)
-                else:
-                    bgr_img = cv2.imdecode(raw_color_data, cv2.IMREAD_COLOR)
-
-                if bgr_img is None:
-                    continue
-
-                # 放入队列
-                if queue.full():
-                    try:
-                        queue.get_nowait()
-                    except:
-                        pass
-                queue.put(bgr_img)
-
-                frame_count += 1
-
-                # 定期打印帧率
-                current_time = time.time()
-                if current_time - last_log_time >= 2.0:
-                    elapsed = current_time - last_log_time
-                    fps = frame_count / elapsed
-                    # logger.info(f"📊 相机帧率：{fps:.1f} FPS")
-                    frame_count = 0
-                    last_log_time = current_time
-
-            except Exception as e:
-                logger.error(f"⚠️ 数据转换异常：{e}")
-                continue
-
-    except ImportError:
-        logger.warning("⚠️ 未检测到奥比中光 SDK，使用普通 USB 摄像头")
-
-        if camera_path is None:
-            cap = cv2.VideoCapture(0)  # 默认使用第一个摄像头
-        else:
-            cap = cv2.VideoCapture(camera_path)
-
-        # 设置常用参数
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        cap.set(cv2.CAP_PROP_FPS, 30)
-
-        if not cap.isOpened():
-            logger.error("❌ 无法打开摄像头")
-            return
-
-        logger.info(f"✅ USB 摄像头已启动 (设备：{camera_path or '0'})")
-
-        frame_count = 0
-        last_log_time = time.time()
-
-        while True:
-            success, image = cap.read()
-            if not success:
-                logger.warning("⚠️ 读取摄像头失败")
-                continue
-
+            frames = pipeline.wait_for_frames()
+            aligned = align.process(frames)
+            color_img = np.asanyarray(aligned.get_color_frame().get_data())
+            depth_img = np.asanyarray(aligned.get_depth_frame().get_data())
             if queue.full():
                 try:
                     queue.get_nowait()
-                except:
+                except Empty:
                     pass
-            queue.put(image)
+            queue.put(color_img)
+    finally:
+        pipeline.stop()
 
-            frame_count += 1
 
-            # 定期打印帧率
-            current_time = time.time()
-            if current_time - last_log_time >= 2.0:
-                elapsed = current_time - last_log_time
-                fps = frame_count / elapsed
-                logger.info(f"📊 相机帧率：{fps:.1f} FPS")
-                frame_count = 0
-                last_log_time = current_time
-
-            time.sleep(1 / 30.0)  # 控制帧率在 30FPS
-
-    except KeyboardInterrupt:
-        logger.info("\n⏹️ 停止相机采集...")
-    except Exception as e:
-        logger.error(f"❌ 相机异常：{e}")
+# def produce_frame(queue: multiprocessing.Queue, camera_path: Optional[str] = None):
+#     """使用奥比中光相机采集图像 - 参考官方最佳实践"""
+#     try:
+#         import pyorbbecsdk as ob
+#         from pyorbbecsdk import OBSensorType, OBFormat, AlignFilter, OBStreamType
+#
+#         # 使用奥比中光 SDK
+#         pipeline = ob.Pipeline()
+#         config = ob.Config()
+#
+#         logger.info("🚀 正在初始化奥比中光相机...")
+#
+#         try:
+#             # 配置深度流
+#             profile_list = pipeline.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+#             depth_profile = profile_list.get_video_stream_profile(640, 480, OBFormat.Y16, 30)
+#             config.enable_stream(depth_profile)
+#
+#             # 配置彩色流
+#             color_profiles = pipeline.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
+#             color_profile = color_profiles.get_video_stream_profile(640, 480, OBFormat.RGB, 30)
+#             config.enable_stream(color_profile)
+#
+#         except Exception as e:
+#             logger.warning(f"⚠️ 配置失败：{e}，尝试默认配置")
+#             config.enable_all_stream()
+#
+#         pipeline.start(config)
+#         align_filter = AlignFilter(OBStreamType.COLOR_STREAM)
+#
+#         logger.info("✅ 奥比中光相机已启动")
+#
+#         frame_count = 0
+#         last_log_time = time.time()
+#
+#         while True:
+#             frames = pipeline.wait_for_frames(1000)
+#             if frames is None:
+#                 continue
+#
+#             aligned_frames = align_filter.process(frames)
+#             if aligned_frames is None:
+#                 continue
+#
+#             color_frame = aligned_frames.get_color_frame()
+#             if color_frame is None:
+#                 continue
+#
+#             try:
+#                 c_v_frame = color_frame.as_video_frame()
+#                 raw_color_data = np.asanyarray(c_v_frame.get_data(), dtype=np.uint8)
+#                 raw_color_data = np.ascontiguousarray(raw_color_data)
+#
+#                 fmt = c_v_frame.get_format()
+#
+#                 if fmt == OBFormat.BGR:
+#                     bgr_img = raw_color_data.reshape((c_v_frame.get_height(), c_v_frame.get_width(), 3))
+#                 elif fmt == OBFormat.RGB:
+#                     bgr_img = raw_color_data.reshape((c_v_frame.get_height(), c_v_frame.get_width(), 3))
+#                     bgr_img = cv2.cvtColor(bgr_img, cv2.COLOR_RGB2BGR)
+#                 else:
+#                     bgr_img = cv2.imdecode(raw_color_data, cv2.IMREAD_COLOR)
+#
+#                 if bgr_img is None:
+#                     continue
+#
+#                 # 放入队列
+#                 if queue.full():
+#                     try:
+#                         queue.get_nowait()
+#                     except:
+#                         pass
+#                 queue.put(bgr_img)
+#
+#                 frame_count += 1
+#
+#                 # 定期打印帧率
+#                 current_time = time.time()
+#                 if current_time - last_log_time >= 2.0:
+#                     elapsed = current_time - last_log_time
+#                     fps = frame_count / elapsed
+#                     # logger.info(f"📊 相机帧率：{fps:.1f} FPS")
+#                     frame_count = 0
+#                     last_log_time = current_time
+#
+#             except Exception as e:
+#                 logger.error(f"⚠️ 数据转换异常：{e}")
+#                 continue
+#
+#     except KeyboardInterrupt:
+#         logger.info("\n⏹️ 停止相机采集...")
+#     except Exception as e:
+#         logger.error(f"❌ 相机异常：{e}")
 
 
 def main(
